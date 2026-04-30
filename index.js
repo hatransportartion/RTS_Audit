@@ -33,6 +33,7 @@ const ACCOUNTS = {
 const CONFIG = {
   loginUrl: 'https://rtspro.com/',
   purchaseReportUrl: 'https://rtspro.com/factoring/reports/purchase-report',
+  paymentsReportUrl: 'https://rtspro.com/factoring/reports/payments-report',
   selectors: {
     username: 'input[name="username"]',
     password: 'input[name="password"]',
@@ -62,6 +63,10 @@ const CONFIG = {
       fee: 'RTS Fee',
       reserveEscrow: 'RTS Reserve Escrow',
       fundedAmount: 'RTS Funded Amount',
+      paymentDate: 'RTS Payment Date',
+      checkNumber: 'RTS Check Number',
+      activityType: 'RTS Activity Type',
+      checkAmount: 'RTS Check Amount',
     },
   },
   viewport: { width: 1440, height: 900 },
@@ -358,6 +363,134 @@ async function pushPurchasesToAirtable(purchaseMap) {
   console.log(`[airtable] Update complete.`);
 }
 
+function parsePaymentsExcel(filePath) {
+  const wb = XLSX.readFile(filePath);
+  const sheet = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+
+  return rows.map((r) => ({
+    invoiceNo: String(r['Invoice Number'] ?? r['Invoice #'] ?? '').trim(),
+    loadNumber: String(r['Load Number'] ?? '').trim(),
+    purchaseDate: r['Purchase Date'],
+    paymentDate: r['Payment Date'],
+    checkNumber: r['Check Number'],
+    debtorName: r['Debtor Name'],
+    feeDays: r['Fee Days'],
+    invoiceAmount: r['Invoice Amount'],
+    activityType: r['Activity Type'],
+    checkAmount: r['Check Amount'],
+  }));
+}
+
+async function pushPaymentsToAirtable(paymentsMap) {
+  const { baseId, tableId, dispatchField, loadField, fieldMap: fm } = CONFIG.airtable;
+
+  if (paymentsMap.size === 0) {
+    console.log('[airtable] No payments collected — nothing to push.');
+    return;
+  }
+
+  // Collect every invoice + load number we might need to look up
+  const lookupKeys = new Set();
+  for (const r of paymentsMap.values()) {
+    if (r.invoiceNo) lookupKeys.add(r.invoiceNo);
+    if (r.loadNumber) lookupKeys.add(r.loadNumber);
+  }
+  const allKeys = Array.from(lookupKeys);
+
+  console.log(`[airtable] Fetching candidates by ${dispatchField} OR ${loadField}...`);
+  const [byDispatch, byLoad] = await Promise.all([
+    getRecordsByField(baseId, tableId, dispatchField, allKeys),
+    getRecordsByField(baseId, tableId, loadField, allKeys),
+  ]);
+
+  const candidatesById = new Map();
+  for (const r of [...byDispatch, ...byLoad]) candidatesById.set(r.id, r);
+  const candidates = Array.from(candidatesById.values());
+  console.log(`[airtable] ${candidates.length} candidate record(s) (deduped).`);
+
+  const updates = [];
+  const updatedRecordIds = new Set();
+  const unmatched = [];
+
+  for (const payment of paymentsMap.values()) {
+    const inv = payment.invoiceNo;
+    const load = payment.loadNumber;
+
+    const matches = candidates.filter((c) => {
+      const d = String(c.fields[dispatchField] ?? '').trim();
+      const l = String(c.fields[loadField] ?? '').trim();
+      return (inv && d === inv) || (load && l === load);
+    });
+
+    if (matches.length === 0) {
+      unmatched.push(inv || load);
+      continue;
+    }
+
+    const best = matches[0];
+    if (updatedRecordIds.has(best.id)) continue;
+    updatedRecordIds.add(best.id);
+
+    const fields = {};
+    setIfPresent(fields, fm.paymentDate, payment.paymentDate);
+    setIfPresent(fields, fm.checkNumber, payment.checkNumber);
+    setIfPresent(fields, fm.activityType, payment.activityType);
+    setIfPresent(fields, fm.checkAmount, parseMoney(payment.checkAmount));
+
+    if (Object.keys(fields).length === 0) continue;
+    updates.push({ id: best.id, fields });
+  }
+
+  console.log(`[airtable] Matched: ${updates.length}, Unmatched: ${unmatched.length}`);
+  if (unmatched.length) console.log(`[airtable] Unmatched payments:`, unmatched);
+
+  if (updates.length === 0) {
+    console.log('[airtable] Nothing to update.');
+    return;
+  }
+
+  console.log(`[airtable] Updating ${updates.length} record(s) with payment date, check #, activity type & check amount...`);
+  await updateRecords(baseId, tableId, updates);
+  console.log(`[airtable] Update complete.`);
+}
+
+async function processPaymentsReport(page, context, account, dateRange) {
+  ensureDownloadsDir();
+
+  await navigateAuthenticated(page, context, CONFIG.paymentsReportUrl, account);
+  await setDateRangeAndView(page, dateRange);
+
+  console.log('[payments] Waiting 8s for the report to render...');
+  await page.waitForTimeout(8000);
+
+  const downloadBtn = page.locator(CONFIG.selectors.downloadIcon).first();
+  await downloadBtn.waitFor({ state: 'visible', timeout: 15000 });
+
+  console.log('[payments] Clicking download button...');
+  const downloadPromise = page.waitForEvent('download', { timeout: 60000 });
+  await downloadBtn.click();
+  const download = await downloadPromise;
+
+  const filePath = path.join(DOWNLOADS_DIR, `payments-${Date.now()}.xlsx`);
+  await download.saveAs(filePath);
+  console.log(`[payments] Saved: ${filePath}`);
+
+  const rows = parsePaymentsExcel(filePath);
+  console.log(`[payments] Parsed ${rows.length} payment row(s).`);
+
+  const paymentsMap = new Map();
+  for (const r of rows) {
+    const key = r.invoiceNo || r.loadNumber;
+    if (key) paymentsMap.set(key, r);
+  }
+
+  console.log(`[payments] Final Map (${paymentsMap.size} entries):`);
+  console.log(Object.fromEntries(paymentsMap));
+
+  return paymentsMap;
+}
+
 function ensureDownloadsDir() {
   if (!fs.existsSync(DOWNLOADS_DIR)) fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
 }
@@ -396,11 +529,20 @@ async function setDateRangeAndView(page, range) {
   console.log(`[filter] Setting date range: ${range}`);
   const dateInput = page.locator(CONFIG.selectors.dateRangeInput).first();
   await dateInput.waitFor({ state: 'visible', timeout: 20000 });
+
+  console.log(`[filter] Focusing input...`);
   await dateInput.click();
-  await dateInput.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A');
-  await dateInput.press('Delete');
-  await dateInput.type(range, { delay: 30 });
-  await dateInput.press('Tab');
+  await page.waitForTimeout(400);
+
+  console.log(`[filter] Filling value...`);
+  await dateInput.fill('');
+  await dateInput.fill(range);
+  await page.waitForTimeout(300);
+
+  console.log(`[filter] Dismissing any open picker...`);
+  await page.keyboard.press('Escape').catch(() => {});
+  await page.waitForTimeout(300);
+
   await clickView(page);
 }
 
@@ -594,9 +736,51 @@ async function runRTS313(dateRange) {
   await runForAccount(ACCOUNTS['313'], dateRange);
 }
 
-const DATE_RANGE = '04/16/2026 – 04/30/2026';
+async function runPaymentsForAccount(account, dateRange) {
+  console.log(`\n=== Payments run for ${account.name} | range: ${dateRange} ===`);
 
-// Uncomment ONE of the following to run that account:
+  if (!account.user || !account.pass) {
+    throw new Error(`Missing env vars for ${account.name}. Set credentials in .env first.`);
+  }
+
+  const { browser, context, page } = await launchBrowser(account.authFile);
+
+  try {
+    await navigateAuthenticated(page, context, CONFIG.loginUrl, account);
+
+    const paymentsMap = await processPaymentsReport(page, context, account, dateRange);
+    console.log(`\n[summary] ${account.name}: ${paymentsMap.size} payments collected.`);
+
+    await pushPaymentsToAirtable(paymentsMap);
+
+    await saveSession(context, 'end-of-run', account.authFile);
+    await waitForEnter(`\n>>> ${account.name} payments done. Press ENTER to close the browser...\n`);
+  } finally {
+    await context.close();
+    await browser.close();
+  }
+}
+
+async function runPaymentsRTSDefault(dateRange) {
+  await runPaymentsForAccount(ACCOUNTS.default, dateRange);
+}
+
+async function runPaymentsRTSChandi(dateRange) {
+  await runPaymentsForAccount(ACCOUNTS.chandi, dateRange);
+}
+
+async function runPaymentsRTS313(dateRange) {
+  await runPaymentsForAccount(ACCOUNTS['313'], dateRange);
+}
+
+const DATE_RANGE = '04/01/2026 – 04/30/2026';
+
+// === PURCHASES (writes 6 RTS amount fields per matched row) ===
 // runRTSDefault(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
 // runRTSChandi(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
-runRTS313(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
+// runRTS313(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
+
+// === PAYMENTS (writes RTS Payment Date + RTS Check Number) ===
+runPaymentsRTSDefault(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
+// runPaymentsRTSChandi(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
+// runPaymentsRTS313(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
