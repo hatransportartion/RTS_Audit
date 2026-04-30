@@ -9,8 +9,28 @@ import { getRecordsByField, updateRecords } from './airtable.js';
 
 const DOWNLOADS_DIR = path.resolve('downloads');
 
+const ACCOUNTS = {
+  default: {
+    name: 'RTS Default',
+    user: process.env.RTS_USER,
+    pass: process.env.RTS_PASS,
+    authFile: 'auth-default.json',
+  },
+  chandi: {
+    name: 'RTS Chandi',
+    user: process.env.RTS_CHANDI_USER,
+    pass: process.env.RTS_CHANDI_PASS,
+    authFile: 'auth-chandi.json',
+  },
+  '313': {
+    name: 'RTS 313',
+    user: process.env.RTS_313_USER,
+    pass: process.env.RTS_313_PASS,
+    authFile: 'auth-313.json',
+  },
+};
+
 const CONFIG = {
-  authFile: 'auth.json',
   loginUrl: 'https://rtspro.com/',
   purchaseReportUrl: 'https://rtspro.com/factoring/reports/purchase-report',
   selectors: {
@@ -53,15 +73,14 @@ async function waitForEnter(prompt) {
   rl.close();
 }
 
-async function autofillLogin(page) {
-  const { RTS_USER, RTS_PASS } = process.env;
-  if (!RTS_USER || !RTS_PASS) {
-    throw new Error('RTS_USER and RTS_PASS must be set in .env');
+async function autofillLogin(page, account) {
+  if (!account.user || !account.pass) {
+    throw new Error(`Missing credentials for ${account.name} (set the RTS_*_USER and RTS_*_PASS env vars)`);
   }
 
-  console.log('[login] Autofilling credentials...');
+  console.log(`[login] Autofilling credentials for ${account.name}...`);
   await page.waitForSelector(CONFIG.selectors.username, { timeout: 20000 });
-  await page.fill(CONFIG.selectors.username, RTS_USER);
+  await page.fill(CONFIG.selectors.username, account.user);
 
   const passwordVisibleNow = await page
     .locator(CONFIG.selectors.password)
@@ -75,7 +94,7 @@ async function autofillLogin(page) {
   }
 
   console.log('[login] Filling password & submitting...');
-  await page.fill(CONFIG.selectors.password, RTS_PASS);
+  await page.fill(CONFIG.selectors.password, account.pass);
   await page.click(CONFIG.selectors.submit);
 }
 
@@ -83,10 +102,10 @@ function isAuthUrl(url) {
   return /auth\.rtspro\.com|\/u\/login|\/authorize/i.test(url);
 }
 
-async function saveSession(context, label) {
+async function saveSession(context, label, authFile) {
   try {
-    await context.storageState({ path: CONFIG.authFile });
-    console.log(`[auth] Session saved to ${CONFIG.authFile} (${label}).`);
+    await context.storageState({ path: authFile });
+    console.log(`[auth] Session saved to ${authFile} (${label}).`);
   } catch (err) {
     console.error(`[auth] Failed to save session (${label}):`, err.message);
   }
@@ -142,10 +161,10 @@ async function dumpPageDiagnostics(page, label) {
   }
 }
 
-async function runLoginFlow(page, context) {
+async function runLoginFlow(page, context, account) {
   console.log('[auth] Running autofill...');
   try {
-    await autofillLogin(page);
+    await autofillLogin(page, account);
   } catch (err) {
     console.error('[auth] Autofill error (will fall back to manual):', err.message);
   }
@@ -160,10 +179,10 @@ async function runLoginFlow(page, context) {
   console.log('\n>>> Make sure you are fully logged into the RTS app (not on the login page).');
   await waitForEnter('>>> Press ENTER here to save the session...\n');
 
-  await saveSession(context, 'after-login');
+  await saveSession(context, 'after-login', account.authFile);
 }
 
-async function navigateAuthenticated(page, context, targetUrl) {
+async function navigateAuthenticated(page, context, targetUrl, account) {
   console.log(`[nav] Navigating to ${targetUrl}...`);
   await page.goto(targetUrl, { waitUntil: 'load' });
   await page.waitForTimeout(4000);
@@ -173,7 +192,7 @@ async function navigateAuthenticated(page, context, targetUrl) {
 
   if (await isLoginShown(page)) {
     console.log('[nav] Login required.');
-    await runLoginFlow(page, context);
+    await runLoginFlow(page, context, account);
 
     console.log(`[nav] Re-navigating to ${targetUrl}...`);
     await page.goto(targetUrl, { waitUntil: 'load' });
@@ -187,12 +206,13 @@ async function navigateAuthenticated(page, context, targetUrl) {
   }
 }
 
-async function launchBrowser(hasAuth) {
+async function launchBrowser(authFile) {
+  const hasAuth = fs.existsSync(authFile);
   const browser = await chromium.launch({ headless: false });
   const context = await browser.newContext({
     acceptDownloads: true,
     viewport: CONFIG.viewport,
-    storageState: hasAuth ? CONFIG.authFile : undefined,
+    storageState: hasAuth ? authFile : undefined,
     permissions: ['geolocation'],
     geolocation: { latitude: 39.0997, longitude: -94.5786 },
   });
@@ -521,11 +541,11 @@ async function downloadAllRowsSequential(page, purchaseMap) {
   }
 }
 
-async function processPurchaseReport(page, context) {
+async function processPurchaseReport(page, context, account, dateRange) {
   ensureDownloadsDir();
 
-  await navigateAuthenticated(page, context, CONFIG.purchaseReportUrl);
-  await setDateRangeAndView(page, CONFIG.dateRange);
+  await navigateAuthenticated(page, context, CONFIG.purchaseReportUrl, account);
+  await setDateRangeAndView(page, dateRange);
   await setRowsPerPage(page, CONFIG.rowsPerPage);
 
   const purchaseMap = new Map();
@@ -537,31 +557,46 @@ async function processPurchaseReport(page, context) {
   return purchaseMap;
 }
 
-async function main() {
-  const hasAuth = fs.existsSync(CONFIG.authFile);
-  const { browser, context, page } = await launchBrowser(hasAuth);
+async function runForAccount(account, dateRange) {
+  console.log(`\n=== Starting run for ${account.name} | range: ${dateRange} ===`);
+
+  if (!account.user || !account.pass) {
+    throw new Error(`Missing env vars for ${account.name}. Set credentials in .env first.`);
+  }
+
+  const { browser, context, page } = await launchBrowser(account.authFile);
 
   try {
-    // Step 1: open rtspro.com (triggers login if redirected to Auth0)
-    await navigateAuthenticated(page, context, CONFIG.loginUrl);
+    await navigateAuthenticated(page, context, CONFIG.loginUrl, account);
 
-    // Step 2: scrape the purchase report → Map keyed by Invoice No
-    const purchaseMap = await processPurchaseReport(page, context);
-    console.log(`\n[summary] Total purchases collected: ${purchaseMap.size}`);
+    const purchaseMap = await processPurchaseReport(page, context, account, dateRange);
+    console.log(`\n[summary] ${account.name}: ${purchaseMap.size} purchases collected.`);
 
-    // Step 3: look up Airtable records by Dispatch # and update them
     await pushPurchasesToAirtable(purchaseMap);
 
-    await saveSession(context, 'end-of-run');
-
-    await waitForEnter('\n>>> Press ENTER to close the browser...\n');
+    await saveSession(context, 'end-of-run', account.authFile);
+    await waitForEnter(`\n>>> ${account.name} done. Press ENTER to close the browser...\n`);
   } finally {
     await context.close();
     await browser.close();
   }
 }
 
-main().catch((err) => {
-  console.error('Fatal error:', err);
-  process.exit(1);
-});
+async function runRTSDefault(dateRange) {
+  await runForAccount(ACCOUNTS.default, dateRange);
+}
+
+async function runRTSChandi(dateRange) {
+  await runForAccount(ACCOUNTS.chandi, dateRange);
+}
+
+async function runRTS313(dateRange) {
+  await runForAccount(ACCOUNTS['313'], dateRange);
+}
+
+const DATE_RANGE = '04/16/2026 – 04/30/2026';
+
+// Uncomment ONE of the following to run that account:
+// runRTSDefault(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
+// runRTSChandi(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
+runRTS313(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });

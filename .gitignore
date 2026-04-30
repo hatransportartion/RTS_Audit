@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 auth.json
+auth-*.json
 
 # Downloads & generated artifacts
 downloads/
