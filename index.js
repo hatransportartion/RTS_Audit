@@ -34,6 +34,7 @@ const CONFIG = {
   loginUrl: 'https://rtspro.com/',
   purchaseReportUrl: 'https://rtspro.com/factoring/reports/purchase-report',
   paymentsReportUrl: 'https://rtspro.com/factoring/reports/payments-report',
+  recoursedReportUrl: 'https://rtspro.com/factoring/reports/recoursed-report',
   selectors: {
     username: 'input[name="username"]',
     password: 'input[name="password"]',
@@ -67,6 +68,8 @@ const CONFIG = {
       checkNumber: 'RTS Check Number',
       activityType: 'RTS Activity Type',
       checkAmount: 'RTS Check Amount',
+      recourseStatus: 'RTS Recourse Status',
+      recourseDate: 'RTS Recourse Date',
     },
   },
   viewport: { width: 1440, height: 900 },
@@ -491,6 +494,118 @@ async function processPaymentsReport(page, context, account, dateRange) {
   return paymentsMap;
 }
 
+function parseRecoursedExcel(filePath) {
+  const wb = XLSX.readFile(filePath, { cellDates: true });
+  const sheet = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false });
+
+  return rows.map((r) => ({
+    status: r['Status'],
+    customer: r['Customer'],
+    invoiceNo: String(r['Invoice #'] ?? r['Invoice No'] ?? r['Invoice Number'] ?? '').trim(),
+    postDate: r['Post Date'],
+    invoiceAmount: r['Invoice Amount'],
+    recourseDate: r['Recourse Date'],
+  }));
+}
+
+async function pushRecoursedToAirtable(recoursedMap) {
+  const { baseId, tableId, dispatchField, loadField, fieldMap: fm } = CONFIG.airtable;
+
+  if (recoursedMap.size === 0) {
+    console.log('[airtable] No recoursed rows collected — nothing to push.');
+    return;
+  }
+
+  const lookupKeys = Array.from(recoursedMap.keys());
+
+  console.log(`[airtable] Fetching candidates by ${dispatchField} OR ${loadField}...`);
+  const [byDispatch, byLoad] = await Promise.all([
+    getRecordsByField(baseId, tableId, dispatchField, lookupKeys),
+    getRecordsByField(baseId, tableId, loadField, lookupKeys),
+  ]);
+
+  const candidatesById = new Map();
+  for (const r of [...byDispatch, ...byLoad]) candidatesById.set(r.id, r);
+  const candidates = Array.from(candidatesById.values());
+  console.log(`[airtable] ${candidates.length} candidate record(s).`);
+
+  const updates = [];
+  const updatedRecordIds = new Set();
+  const unmatched = [];
+
+  for (const [invoice, row] of recoursedMap) {
+    const matches = candidates.filter((c) => {
+      const d = String(c.fields[dispatchField] ?? '').trim();
+      const l = String(c.fields[loadField] ?? '').trim();
+      return d === invoice || l === invoice;
+    });
+
+    if (matches.length === 0) {
+      unmatched.push(invoice);
+      continue;
+    }
+
+    const best = matches[0];
+    if (updatedRecordIds.has(best.id)) continue;
+    updatedRecordIds.add(best.id);
+
+    const fields = {};
+    setIfPresent(fields, fm.recourseStatus, row.status);
+    setIfPresent(fields, fm.recourseDate, row.recourseDate);
+
+    if (Object.keys(fields).length === 0) continue;
+    updates.push({ id: best.id, fields });
+  }
+
+  console.log(`[airtable] Matched: ${updates.length}, Unmatched: ${unmatched.length}`);
+  if (unmatched.length) console.log(`[airtable] Unmatched recoursed:`, unmatched);
+
+  if (updates.length === 0) {
+    console.log('[airtable] Nothing to update.');
+    return;
+  }
+
+  console.log(`[airtable] Updating ${updates.length} record(s) with recourse status & date...`);
+  await updateRecords(baseId, tableId, updates);
+  console.log(`[airtable] Update complete.`);
+}
+
+async function processRecoursedReport(page, context, account, dateRange) {
+  ensureDownloadsDir();
+
+  await navigateAuthenticated(page, context, CONFIG.recoursedReportUrl, account);
+  await setDateRangeAndView(page, dateRange);
+
+  console.log('[recoursed] Waiting 8s for the report to render...');
+  await page.waitForTimeout(8000);
+
+  const downloadBtn = page.locator(CONFIG.selectors.downloadIcon).first();
+  await downloadBtn.waitFor({ state: 'visible', timeout: 15000 });
+
+  console.log('[recoursed] Clicking download button...');
+  const downloadPromise = page.waitForEvent('download', { timeout: 60000 });
+  await downloadBtn.click();
+  const download = await downloadPromise;
+
+  const filePath = path.join(DOWNLOADS_DIR, `recoursed-${Date.now()}.xlsx`);
+  await download.saveAs(filePath);
+  console.log(`[recoursed] Saved: ${filePath}`);
+
+  const rows = parseRecoursedExcel(filePath);
+  console.log(`[recoursed] Parsed ${rows.length} recoursed row(s).`);
+
+  const recoursedMap = new Map();
+  for (const r of rows) {
+    if (r.invoiceNo) recoursedMap.set(r.invoiceNo, r);
+  }
+
+  console.log(`[recoursed] Final Map (${recoursedMap.size} entries):`);
+  console.log(Object.fromEntries(recoursedMap));
+
+  return recoursedMap;
+}
+
 function ensureDownloadsDir() {
   if (!fs.existsSync(DOWNLOADS_DIR)) fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
 }
@@ -773,6 +888,43 @@ async function runPaymentsRTS313(dateRange) {
   await runPaymentsForAccount(ACCOUNTS['313'], dateRange);
 }
 
+async function runRecoursedForAccount(account, dateRange) {
+  console.log(`\n=== Recoursed run for ${account.name} | range: ${dateRange} ===`);
+
+  if (!account.user || !account.pass) {
+    throw new Error(`Missing env vars for ${account.name}. Set credentials in .env first.`);
+  }
+
+  const { browser, context, page } = await launchBrowser(account.authFile);
+
+  try {
+    await navigateAuthenticated(page, context, CONFIG.loginUrl, account);
+
+    const recoursedMap = await processRecoursedReport(page, context, account, dateRange);
+    console.log(`\n[summary] ${account.name}: ${recoursedMap.size} recoursed rows collected.`);
+
+    await pushRecoursedToAirtable(recoursedMap);
+
+    await saveSession(context, 'end-of-run', account.authFile);
+    await waitForEnter(`\n>>> ${account.name} recoursed done. Press ENTER to close the browser...\n`);
+  } finally {
+    await context.close();
+    await browser.close();
+  }
+}
+
+async function runRecoursedRTSDefault(dateRange) {
+  await runRecoursedForAccount(ACCOUNTS.default, dateRange);
+}
+
+async function runRecoursedRTSChandi(dateRange) {
+  await runRecoursedForAccount(ACCOUNTS.chandi, dateRange);
+}
+
+async function runRecoursedRTS313(dateRange) {
+  await runRecoursedForAccount(ACCOUNTS['313'], dateRange);
+}
+
 const DATE_RANGE = '04/01/2026 – 04/30/2026';
 
 // === PURCHASES (writes 6 RTS amount fields per matched row) ===
@@ -781,6 +933,11 @@ const DATE_RANGE = '04/01/2026 – 04/30/2026';
 // runRTS313(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
 
 // === PAYMENTS (writes RTS Payment Date + RTS Check Number) ===
-runPaymentsRTSDefault(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
+// runPaymentsRTSDefault(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
 // runPaymentsRTSChandi(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
 // runPaymentsRTS313(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
+
+// === RECOURSED (writes RTS Recourse Status + RTS Recourse Date) ===
+// runRecoursedRTSDefault(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
+runRecoursedRTSChandi(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
+// runRecoursedRTS313(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
