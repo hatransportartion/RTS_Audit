@@ -4,12 +4,13 @@ import readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import XLSX from 'xlsx';
 import { getRecordsByField, updateRecords } from './airtable.js';
 
 const DOWNLOADS_DIR = path.resolve('downloads');
 
-const ACCOUNTS = {
+export const ACCOUNTS = {
   default: {
     name: 'RTS Default',
     user: process.env.RTS_USER,
@@ -30,7 +31,7 @@ const ACCOUNTS = {
   },
 };
 
-const CONFIG = {
+export const CONFIG = {
   loginUrl: 'https://rtspro.com/',
   purchaseReportUrl: 'https://rtspro.com/factoring/reports/purchase-report',
   paymentsReportUrl: 'https://rtspro.com/factoring/reports/payments-report',
@@ -73,6 +74,7 @@ const CONFIG = {
     },
   },
   viewport: { width: 1440, height: 900 },
+  autoClose: false, // when true, skips the "Press ENTER to close" prompt at the end of each report
 };
 
 async function waitForEnter(prompt) {
@@ -411,6 +413,10 @@ async function pushPaymentsToAirtable(paymentsMap) {
   for (const r of [...byDispatch, ...byLoad]) candidatesById.set(r.id, r);
   const candidates = Array.from(candidatesById.values());
   console.log(`[airtable] ${candidates.length} candidate record(s) (deduped).`);
+  console.log(`[airtable]   - byDispatch: ${byDispatch.length}, byLoad: ${byLoad.length}`);
+  if (candidates[0]) {
+    console.log(`[airtable]   - sample candidate fields: ${dispatchField}=${JSON.stringify(candidates[0].fields[dispatchField])}, ${loadField}=${JSON.stringify(candidates[0].fields[loadField])}`);
+  }
 
   const updates = [];
   const updatedRecordIds = new Set();
@@ -832,22 +838,24 @@ async function runForAccount(account, dateRange) {
     await pushPurchasesToAirtable(purchaseMap);
 
     await saveSession(context, 'end-of-run', account.authFile);
-    await waitForEnter(`\n>>> ${account.name} done. Press ENTER to close the browser...\n`);
+    if (!CONFIG.autoClose) {
+      await waitForEnter(`\n>>> ${account.name} done. Press ENTER to close the browser...\n`);
+    }
   } finally {
     await context.close();
     await browser.close();
   }
 }
 
-async function runRTSDefault(dateRange) {
+export async function runRTSDefault(dateRange) {
   await runForAccount(ACCOUNTS.default, dateRange);
 }
 
-async function runRTSChandi(dateRange) {
+export async function runRTSChandi(dateRange) {
   await runForAccount(ACCOUNTS.chandi, dateRange);
 }
 
-async function runRTS313(dateRange) {
+export async function runRTS313(dateRange) {
   await runForAccount(ACCOUNTS['313'], dateRange);
 }
 
@@ -869,22 +877,24 @@ async function runPaymentsForAccount(account, dateRange) {
     await pushPaymentsToAirtable(paymentsMap);
 
     await saveSession(context, 'end-of-run', account.authFile);
-    await waitForEnter(`\n>>> ${account.name} payments done. Press ENTER to close the browser...\n`);
+    if (!CONFIG.autoClose) {
+      await waitForEnter(`\n>>> ${account.name} payments done. Press ENTER to close the browser...\n`);
+    }
   } finally {
     await context.close();
     await browser.close();
   }
 }
 
-async function runPaymentsRTSDefault(dateRange) {
+export async function runPaymentsRTSDefault(dateRange) {
   await runPaymentsForAccount(ACCOUNTS.default, dateRange);
 }
 
-async function runPaymentsRTSChandi(dateRange) {
+export async function runPaymentsRTSChandi(dateRange) {
   await runPaymentsForAccount(ACCOUNTS.chandi, dateRange);
 }
 
-async function runPaymentsRTS313(dateRange) {
+export async function runPaymentsRTS313(dateRange) {
   await runPaymentsForAccount(ACCOUNTS['313'], dateRange);
 }
 
@@ -906,38 +916,44 @@ async function runRecoursedForAccount(account, dateRange) {
     await pushRecoursedToAirtable(recoursedMap);
 
     await saveSession(context, 'end-of-run', account.authFile);
-    await waitForEnter(`\n>>> ${account.name} recoursed done. Press ENTER to close the browser...\n`);
+    if (!CONFIG.autoClose) {
+      await waitForEnter(`\n>>> ${account.name} recoursed done. Press ENTER to close the browser...\n`);
+    }
   } finally {
     await context.close();
     await browser.close();
   }
 }
 
-async function runRecoursedRTSDefault(dateRange) {
+export async function runRecoursedRTSDefault(dateRange) {
   await runRecoursedForAccount(ACCOUNTS.default, dateRange);
 }
 
-async function runRecoursedRTSChandi(dateRange) {
+export async function runRecoursedRTSChandi(dateRange) {
   await runRecoursedForAccount(ACCOUNTS.chandi, dateRange);
 }
 
-async function runRecoursedRTS313(dateRange) {
+export async function runRecoursedRTS313(dateRange) {
   await runRecoursedForAccount(ACCOUNTS['313'], dateRange);
 }
 
 const DATE_RANGE = '04/01/2026 – 04/30/2026';
 
-// === PURCHASES (writes 6 RTS amount fields per matched row) ===
-// runRTSDefault(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
-// runRTSChandi(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
-// runRTS313(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
+const isMainModule = process.argv[1] === fileURLToPath(import.meta.url);
 
-// === PAYMENTS (writes RTS Payment Date + RTS Check Number) ===
-// runPaymentsRTSDefault(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
-// runPaymentsRTSChandi(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
-// runPaymentsRTS313(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
+if (isMainModule) {
+  // === PURCHASES (writes 6 RTS amount fields per matched row) ===
+  // runRTSDefault(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
+  // runRTSChandi(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
+  // runRTS313(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
 
-// === RECOURSED (writes RTS Recourse Status + RTS Recourse Date) ===
-// runRecoursedRTSDefault(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
-runRecoursedRTSChandi(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
-// runRecoursedRTS313(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
+  // === PAYMENTS (writes RTS Payment Date + RTS Check Number) ===
+  // runPaymentsRTSDefault(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
+  // runPaymentsRTSChandi(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
+  // runPaymentsRTS313(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
+
+  // === RECOURSED (writes RTS Recourse Status + RTS Recourse Date) ===
+  // runRecoursedRTSDefault(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
+  runRecoursedRTSChandi(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
+  // runRecoursedRTS313(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
+}

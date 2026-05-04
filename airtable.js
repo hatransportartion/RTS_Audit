@@ -47,8 +47,9 @@ export async function getRecordsByField(baseId, tableId, fieldName, values) {
 
   for (let i = 0; i < values.length; i += BATCH) {
     const batch = values.slice(i, i + BATCH);
+    // Force string comparison so this works for both text and number Airtable fields
     const formula = `OR(${batch
-      .map((v) => `{${fieldName}}='${escape(v)}'`)
+      .map((v) => `{${fieldName}}&''='${escape(v)}'`)
       .join(',')})`;
 
     let offset;
