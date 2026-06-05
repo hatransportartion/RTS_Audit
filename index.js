@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import XLSX from 'xlsx';
-import { getRecordsByField, updateRecords } from './airtable.js';
+import { getRecordsByField, updateRecords, createRecords } from './airtable.js';
 
 const DOWNLOADS_DIR = path.resolve('downloads');
 
@@ -54,6 +54,7 @@ export const CONFIG = {
   airtable: {
     baseId: 'appFZQtRfsGDkCun4',
     tableId: 'tblO5X9igZQEzaWfw',
+    unmatchedTableId: 'tblJuB1CbkwZrrRa9', // "RTS Unambigous Loads"
     dispatchField: 'Dispatch #', // 5-digit number
     loadField: 'Load Number',    // any length
     customerField: 'Customer',
@@ -271,6 +272,90 @@ function amountsMatch(a, b) {
   return Math.abs(na - nb) < 0.01;
 }
 
+function todayISO() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function cleanFields(obj) {
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (v === null || v === undefined || v === '') continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+async function pushUnresolvedToAirtable(report, account, rows) {
+  const { baseId, unmatchedTableId } = CONFIG.airtable;
+  if (!unmatchedTableId) {
+    console.log('[unresolved] unmatchedTableId not set — skipping.');
+    return;
+  }
+  if (!rows.length) {
+    console.log(`[unresolved] No ${report} unresolved rows for ${account.name}.`);
+    return;
+  }
+
+  const today = todayISO();
+
+  const records = rows
+    .filter((r) => r.loadNumber)
+    .map((r) => ({
+      key: `${account.name}-${report}-${r.loadNumber}`,
+      fields: cleanFields({
+        Key: `${account.name}-${report}-${r.loadNumber}`,
+        'Load Number': r.loadNumber,
+        Customer: r.customer,
+        Amount: parseMoney(r.amount),
+        Account: account.name,
+        Report: report,
+        Reason: r.reason,
+        'RTS Date': r.rtsDate,
+        'Date Found': today,
+        'Top Candidate Customer': r.topCandidateCustomer,
+      }),
+    }));
+
+  if (!records.length) return;
+
+  const keys = records.map((r) => r.key);
+  const existing = await getRecordsByField(baseId, unmatchedTableId, 'Key', keys);
+  const existingByKey = new Map(existing.map((e) => [e.fields.Key, e]));
+
+  const creates = [];
+  const updates = [];
+  let skippedResolved = 0;
+
+  for (const rec of records) {
+    const ex = existingByKey.get(rec.key);
+    if (ex) {
+      if (ex.fields.Resolved) {
+        skippedResolved++;
+        continue;
+      }
+      const runCount = Number(ex.fields['Run Count'] ?? 0) + 1;
+      updates.push({
+        id: ex.id,
+        fields: cleanFields({
+          'Date Found': today,
+          'Run Count': runCount,
+          'Top Candidate Customer': rec.fields['Top Candidate Customer'],
+        }),
+      });
+    } else {
+      creates.push({ fields: { ...rec.fields, 'Run Count': 1 } });
+    }
+  }
+
+  console.log(
+    `[unresolved] ${report}/${account.name}: ${creates.length} new, ${updates.length} bumped, ${skippedResolved} skipped (Resolved).`
+  );
+
+  if (updates.length) await updateRecords(baseId, unmatchedTableId, updates);
+  if (creates.length) await createRecords(baseId, unmatchedTableId, creates);
+}
+
 async function pushPurchasesToAirtable(purchaseMap) {
   const {
     baseId,
@@ -301,7 +386,7 @@ async function pushPurchasesToAirtable(purchaseMap) {
 
   const updates = [];
   const matched = new Set();
-  const ambiguous = [];
+  const ambiguousRows = [];
 
   for (const [invoiceNo, purchase] of purchaseMap) {
     // Find candidates whose Dispatch # OR Load # equals this invoice
@@ -332,7 +417,15 @@ async function pushPurchasesToAirtable(purchaseMap) {
 
     // Confidence threshold: customer fuzzy >= 0.5 OR collect amount matches
     if (!best || bestScore < 0.5) {
-      ambiguous.push({ invoiceNo, candidates: numberMatches.length, score: bestScore });
+      const topCust = best?.fields?.[customerField];
+      ambiguousRows.push({
+        loadNumber: invoiceNo,
+        customer: purchase.customer,
+        amount: purchase.invoiceAmount,
+        rtsDate: purchase.date,
+        reason: 'Ambiguous',
+        topCandidateCustomer: Array.isArray(topCust) ? topCust.join(', ') : topCust,
+      });
       continue;
     }
 
@@ -353,19 +446,35 @@ async function pushPurchasesToAirtable(purchaseMap) {
     updates.push({ id: best.id, fields });
   }
 
-  const unmatched = invoiceNos.filter((d) => !matched.has(d));
-  console.log(`[airtable] Matched: ${updates.length}, Unmatched: ${unmatched.length}, Ambiguous: ${ambiguous.length}`);
-  if (unmatched.length) console.log(`[airtable] Unmatched invoices:`, unmatched);
-  if (ambiguous.length) console.log(`[airtable] Ambiguous (number matched but customer/collect didn't verify):`, ambiguous);
-
-  if (updates.length === 0) {
-    console.log('[airtable] Nothing to update.');
-    return;
+  const unmatchedRows = [];
+  for (const [invoiceNo, purchase] of purchaseMap) {
+    const hadNumberMatch = candidates.some((c) => {
+      const d = String(c.fields[dispatchField] ?? '').trim();
+      const l = String(c.fields[loadField] ?? '').trim();
+      return d === invoiceNo || l === invoiceNo;
+    });
+    if (!hadNumberMatch) {
+      unmatchedRows.push({
+        loadNumber: invoiceNo,
+        customer: purchase.customer,
+        amount: purchase.invoiceAmount,
+        rtsDate: purchase.date,
+        reason: 'Unmatched',
+      });
+    }
   }
 
-  console.log(`[airtable] Updating ${updates.length} record(s) with 6 RTS fields...`);
-  await updateRecords(baseId, tableId, updates);
-  console.log(`[airtable] Update complete.`);
+  console.log(`[airtable] Matched: ${updates.length}, Unmatched: ${unmatchedRows.length}, Ambiguous: ${ambiguousRows.length}`);
+
+  if (updates.length) {
+    console.log(`[airtable] Updating ${updates.length} record(s) with 6 RTS fields...`);
+    await updateRecords(baseId, tableId, updates);
+    console.log(`[airtable] Update complete.`);
+  } else {
+    console.log('[airtable] Nothing to update.');
+  }
+
+  return { unmatched: unmatchedRows, ambiguous: ambiguousRows };
 }
 
 function parsePaymentsExcel(filePath) {
@@ -420,7 +529,7 @@ async function pushPaymentsToAirtable(paymentsMap) {
 
   const updates = [];
   const updatedRecordIds = new Set();
-  const unmatched = [];
+  const unmatchedRows = [];
 
   for (const payment of paymentsMap.values()) {
     const inv = payment.invoiceNo;
@@ -433,7 +542,13 @@ async function pushPaymentsToAirtable(paymentsMap) {
     });
 
     if (matches.length === 0) {
-      unmatched.push(inv || load);
+      unmatchedRows.push({
+        loadNumber: inv || load,
+        customer: payment.debtorName,
+        amount: payment.checkAmount ?? payment.invoiceAmount,
+        rtsDate: payment.paymentDate || payment.purchaseDate,
+        reason: 'Unmatched',
+      });
       continue;
     }
 
@@ -451,17 +566,17 @@ async function pushPaymentsToAirtable(paymentsMap) {
     updates.push({ id: best.id, fields });
   }
 
-  console.log(`[airtable] Matched: ${updates.length}, Unmatched: ${unmatched.length}`);
-  if (unmatched.length) console.log(`[airtable] Unmatched payments:`, unmatched);
+  console.log(`[airtable] Matched: ${updates.length}, Unmatched: ${unmatchedRows.length}`);
 
-  if (updates.length === 0) {
+  if (updates.length) {
+    console.log(`[airtable] Updating ${updates.length} record(s) with payment date, check #, activity type & check amount...`);
+    await updateRecords(baseId, tableId, updates);
+    console.log(`[airtable] Update complete.`);
+  } else {
     console.log('[airtable] Nothing to update.');
-    return;
   }
 
-  console.log(`[airtable] Updating ${updates.length} record(s) with payment date, check #, activity type & check amount...`);
-  await updateRecords(baseId, tableId, updates);
-  console.log(`[airtable] Update complete.`);
+  return { unmatched: unmatchedRows, ambiguous: [] };
 }
 
 async function processPaymentsReport(page, context, account, dateRange) {
@@ -538,7 +653,7 @@ async function pushRecoursedToAirtable(recoursedMap) {
 
   const updates = [];
   const updatedRecordIds = new Set();
-  const unmatched = [];
+  const unmatchedRows = [];
 
   for (const [invoice, row] of recoursedMap) {
     const matches = candidates.filter((c) => {
@@ -548,7 +663,13 @@ async function pushRecoursedToAirtable(recoursedMap) {
     });
 
     if (matches.length === 0) {
-      unmatched.push(invoice);
+      unmatchedRows.push({
+        loadNumber: invoice,
+        customer: row.customer,
+        amount: row.invoiceAmount,
+        rtsDate: row.recourseDate || row.postDate,
+        reason: 'Unmatched',
+      });
       continue;
     }
 
@@ -564,17 +685,17 @@ async function pushRecoursedToAirtable(recoursedMap) {
     updates.push({ id: best.id, fields });
   }
 
-  console.log(`[airtable] Matched: ${updates.length}, Unmatched: ${unmatched.length}`);
-  if (unmatched.length) console.log(`[airtable] Unmatched recoursed:`, unmatched);
+  console.log(`[airtable] Matched: ${updates.length}, Unmatched: ${unmatchedRows.length}`);
 
-  if (updates.length === 0) {
+  if (updates.length) {
+    console.log(`[airtable] Updating ${updates.length} record(s) with recourse status & date...`);
+    await updateRecords(baseId, tableId, updates);
+    console.log(`[airtable] Update complete.`);
+  } else {
     console.log('[airtable] Nothing to update.');
-    return;
   }
 
-  console.log(`[airtable] Updating ${updates.length} record(s) with recourse status & date...`);
-  await updateRecords(baseId, tableId, updates);
-  console.log(`[airtable] Update complete.`);
+  return { unmatched: unmatchedRows, ambiguous: [] };
 }
 
 async function processRecoursedReport(page, context, account, dateRange) {
@@ -835,7 +956,10 @@ async function runForAccount(account, dateRange) {
     const purchaseMap = await processPurchaseReport(page, context, account, dateRange);
     console.log(`\n[summary] ${account.name}: ${purchaseMap.size} purchases collected.`);
 
-    await pushPurchasesToAirtable(purchaseMap);
+    const result = await pushPurchasesToAirtable(purchaseMap);
+    if (result) {
+      await pushUnresolvedToAirtable('Purchases', account, [...result.unmatched, ...result.ambiguous]);
+    }
 
     await saveSession(context, 'end-of-run', account.authFile);
     if (!CONFIG.autoClose) {
@@ -874,7 +998,10 @@ async function runPaymentsForAccount(account, dateRange) {
     const paymentsMap = await processPaymentsReport(page, context, account, dateRange);
     console.log(`\n[summary] ${account.name}: ${paymentsMap.size} payments collected.`);
 
-    await pushPaymentsToAirtable(paymentsMap);
+    const result = await pushPaymentsToAirtable(paymentsMap);
+    if (result) {
+      await pushUnresolvedToAirtable('Payments', account, [...result.unmatched, ...result.ambiguous]);
+    }
 
     await saveSession(context, 'end-of-run', account.authFile);
     if (!CONFIG.autoClose) {
@@ -913,7 +1040,10 @@ async function runRecoursedForAccount(account, dateRange) {
     const recoursedMap = await processRecoursedReport(page, context, account, dateRange);
     console.log(`\n[summary] ${account.name}: ${recoursedMap.size} recoursed rows collected.`);
 
-    await pushRecoursedToAirtable(recoursedMap);
+    const result = await pushRecoursedToAirtable(recoursedMap);
+    if (result) {
+      await pushUnresolvedToAirtable('Recoursed', account, [...result.unmatched, ...result.ambiguous]);
+    }
 
     await saveSession(context, 'end-of-run', account.authFile);
     if (!CONFIG.autoClose) {
@@ -937,13 +1067,14 @@ export async function runRecoursedRTS313(dateRange) {
   await runRecoursedForAccount(ACCOUNTS['313'], dateRange);
 }
 
-const DATE_RANGE = '04/01/2026 – 04/30/2026';
+const DATE_RANGE = '02/01/2026 – 02/28/2026';
 
 const isMainModule = process.argv[1] === fileURLToPath(import.meta.url);
 
 if (isMainModule) {
   // === PURCHASES (writes 6 RTS amount fields per matched row) ===
-  // runRTSDefault(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
+  // Run one at a time: keep ONE line uncommented, run `npm run dev`, then swap to the next.
+  runRTSDefault(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
   // runRTSChandi(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
   // runRTS313(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
 
@@ -954,6 +1085,6 @@ if (isMainModule) {
 
   // === RECOURSED (writes RTS Recourse Status + RTS Recourse Date) ===
   // runRecoursedRTSDefault(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
-  runRecoursedRTSChandi(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
+  // runRecoursedRTSChandi(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
   // runRecoursedRTS313(DATE_RANGE).catch((err) => { console.error('Fatal error:', err); process.exit(1); });
 }

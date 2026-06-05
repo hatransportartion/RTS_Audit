@@ -79,6 +79,38 @@ export async function getRecordsByField(baseId, tableId, fieldName, values) {
   return records;
 }
 
+export async function createRecords(baseId, tableId, creates) {
+  const token = process.env.AIRTABLE_TOKEN;
+  if (!token) throw new Error('AIRTABLE_TOKEN missing in .env');
+  if (!baseId || !tableId) throw new Error('baseId and tableId are required');
+  if (!creates.length) return [];
+
+  const url = `${AIRTABLE_API}/${baseId}/${encodeURIComponent(tableId)}`;
+  const created = [];
+
+  for (let i = 0; i < creates.length; i += 10) {
+    const batch = creates.slice(i, i + 10);
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ records: batch, typecast: true }),
+    });
+
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`Airtable create ${res.status} ${res.statusText}: ${body}`);
+    }
+
+    const data = await res.json();
+    created.push(...data.records);
+  }
+
+  return created;
+}
+
 export async function updateRecords(baseId, tableId, updates) {
   const token = process.env.AIRTABLE_TOKEN;
   if (!token) throw new Error('AIRTABLE_TOKEN missing in .env');
