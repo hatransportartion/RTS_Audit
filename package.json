@@ -11,7 +11,10 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "date-fns": "^4.4.0",
     "dotenv": "^17.4.2",
+    "node-cron": "^4.5.0",
+    "p-each-series": "^3.0.0",
     "playwright": "^1.59.1",
     "xlsx": "^0.18.5"
   }
