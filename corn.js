@@ -1,5 +1,5 @@
 import cron from 'node-cron';
-import { format, subDays } from 'date-fns';
+import { format, subDays, startOfMonth, startOfYear } from 'date-fns';
 import pEachSeries from 'p-each-series';
 import {
   runRTSDefault, runPaymentsRTSDefault, runRecoursedRTSDefault,
@@ -7,26 +7,37 @@ import {
   runRTS313,     runPaymentsRTS313,     runRecoursedRTS313,
 } from './index.js';
 
-const TASKS = [
-  ['runRTSDefault',          runRTSDefault],
-  ['runPaymentsRTSDefault',  runPaymentsRTSDefault],
-  ['runRecoursedRTSDefault', runRecoursedRTSDefault],
+const MONTHLY_UPDATE = [
+  ['runPaymentsRTSDefault',   runPaymentsRTSDefault],
+  ['runPaymentsRTSChandi',   runPaymentsRTSChandi],
+  ['runPaymentsRTS313',      runPaymentsRTS313],
+
+];
+
+
+const YEARLY_UPDATE = [
+  ['runRTSDefault',           runRTSDefault],
   ['runRTSChandi',           runRTSChandi],
   ['runPaymentsRTSChandi',   runPaymentsRTSChandi],
   ['runRecoursedRTSChandi',  runRecoursedRTSChandi],
   ['runRTS313',              runRTS313],
-  ['runPaymentsRTS313',      runPaymentsRTS313],
   ['runRecoursedRTS313',     runRecoursedRTS313],
 ];
 
 let isRunning = false;
 
-async function runForDate(targetDate) {
-  const s = format(targetDate, 'MM/dd/yyyy');
-  const range = `${s} – ${s}`;
-  console.log(`\n========== ${range} ==========`);
+// Build a "MM/dd/yyyy – MM/dd/yyyy" range string.
+function buildRange(fromDate, toDate) {
+  const from = format(fromDate, 'MM/dd/yyyy');
+  const to = format(toDate, 'MM/dd/yyyy');
+  return `${from} – ${to}`;
+}
 
-  await pEachSeries(TASKS, async ([name, fn]) => {
+// Run a given set of tasks over a given range.
+async function runTasks(tasks, range, label) {
+  console.log(`\n========== ${label}: ${range} ==========`);
+
+  await pEachSeries(tasks, async ([name, fn]) => {
     try {
       console.log(`   → ${name}`);
       await fn(range);
@@ -35,36 +46,53 @@ async function runForDate(targetDate) {
     }
   });
 
-  console.log(`✅ Done for ${range}`);
+  console.log(`✅ Done ${label} for ${range}`);
 }
 
-// CHANGE THIS LINE when you decide the time
-cron.schedule('0 2 * * *', async () => {
+// Monthly update: only the current month's data (1st of month → yesterday).
+async function runMonthlyUpdate() {
+  const yesterday = subDays(new Date(), 1);
+  const range = buildRange(startOfMonth(yesterday), yesterday);
+  await runTasks(MONTHLY_UPDATE, range, 'MONTHLY_UPDATE');
+}
+
+// Yearly update: from Jan 1 of the current year → yesterday.
+async function runYearlyUpdate() {
+  const yesterday = subDays(new Date(), 1);
+  const range = buildRange(startOfYear(yesterday), yesterday);
+  await runTasks(YEARLY_UPDATE, range, 'YEARLY_UPDATE');
+}
+
+// Wrap an update so only one run happens at a time.
+async function guardedRun(fn) {
   if (isRunning) {
-    console.log(`[${new Date().toISOString()}] ⏭️  Previous run active, skipping.`);
     return;
   }
   isRunning = true;
-  console.log(`[${new Date().toISOString()}] 🕑 Cron triggered`);
   try {
-    await runForDate(subDays(new Date(), 1));
+    await fn();
   } catch (err) {
     console.error('Fatal cron error:', err);
   } finally {
     isRunning = false;
   }
-}, {
+}
+
+// Run monthly update first, then yearly update — one after the other.
+async function runAllUpdates() {
+  await runMonthlyUpdate();
+  await runYearlyUpdate();
+}
+
+// Every day at 2:00 AM PST: monthly update, then yearly update.
+cron.schedule('0 2 * * *', () => guardedRun(runAllUpdates), {
   timezone: 'America/Los_Angeles'
 });
 
 if (process.argv.includes('--now')) {
-  console.log('🚀 Running immediately (test mode)...');
-  isRunning = true;
-  runForDate(subDays(new Date(), 1)).finally(() => {
-    isRunning = false;
-    console.log('Test run complete. Cron still scheduled — Ctrl+C to stop.');
-  });
+  guardedRun(runAllUpdates);
 }
 
 console.log('🕐 Cron scheduler started.');
-console.log('Waiting for the next scheduled run (2:00 AM PST) or use --now to run immediately.');
+console.log('Daily 2:00 AM PST: monthly update, then yearly update.');
+console.log('Manual: --now (runs monthly then yearly immediately).');
